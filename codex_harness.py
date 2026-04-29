@@ -6,186 +6,171 @@ Chunks large tasks, tracks progress, retries on failure, merges results.
 
 import argparse
 import json
-import os
-import signal
+import re
+import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
-# ── ANSI colors ──────────────────────────────────────────────
-C = {
-    "reset": "\033[0m",
-    "bold": "\033[1m",
-    "dim": "\033[2m",
-    "green": "\033[32m",
-    "red": "\033[31m",
-    "yellow": "\033[33m",
-    "blue": "\033[34m",
-    "cyan": "\033[36m",
-    "magenta": "\033[35m",
-}
+# ── ANSI ─────────────────────────────────────────────────────
+BOLD, DIM, GREEN, RED, YELLOW, CYAN, RESET = "\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[33m", "\033[36m", "\033[0m"
 
+def ok(s):    return f"{GREEN}{s}{RESET}"
+def fail(s):  return f"{RED}{s}{RESET}"
+def dim(s):   return f"{DIM}{s}{RESET}"
+def hl(s):    return f"{BOLD}{s}{RESET}"
 
-def c(tag, text):
-    return f"{C.get(tag, '')}{text}{C['reset']}"
-
-
-def status(chunk, total, label, state="running"):
-    symbols = {"running": "⏳", "done": "✓", "failed": "✗", "pending": "○"}
-    colors = {"running": "yellow", "done": "green", "failed": "red", "pending": "dim"}
-    sym = symbols.get(state, "?")
-    col = colors.get(state, "dim")
-    return f"  [{chunk}/{total}] {c(col, sym)} {label}"
-
-
-# ── Run one chunk ───────────────────────────────────────────
+# ── Run one codex chunk ──────────────────────────────────────
 def run_chunk(chunk_id, prompt, model, workdir, timeout=600):
-    """Run codex exec for a single chunk. Returns dict with result."""
-    result_file = Path(workdir) / f"_harness_result_{chunk_id}.json"
-    full_prompt = f"""{prompt}
-
-IMPORTANT: When you finish, write a JSON summary to {result_file}:
-{{"chunk": {chunk_id}, "status": "success"|"failed", "files_changed": [...], "files_read": [...], "output_summary": "..."}}"""
+    """Run codex exec. Return {chunk, status, summary, stderr_tail}."""
+    # Write prompt to temp file to avoid shell escaping issues
+    prompt_file = Path(workdir) / f"_harness_prompt_{chunk_id}.txt"
+    prompt_file.write_text(prompt)
 
     try:
         proc = subprocess.run(
-            ["codex", "exec", "--full-auto", "--model", model, full_prompt],
+            ["codex", "exec", "--full-auto", "--model", model, f"@{prompt_file}"],
             cwd=workdir,
             capture_output=True,
             text=True,
             timeout=timeout,
         )
 
-        if result_file.exists():
-            try:
-                data = json.loads(result_file.read_text())
-                return data
-            except json.JSONDecodeError:
-                pass
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
 
-        # Fallback: parse from stdout
+        # Extract "tokens used" line for summary
+        tokens_line = ""
+        for line in stdout.split("\n"):
+            if "tokens used" in line.lower():
+                tokens_line = line.strip()
+                break
+
+        # Last meaningful output line
+        stdout_lines = [l for l in stdout.split("\n") if l.strip() and not l.startswith("diff --git")]
+        summary = stdout_lines[-1][:200] if stdout_lines else "(no output)"
+
         return {
             "chunk": chunk_id,
             "status": "success" if proc.returncode == 0 else "failed",
-            "files_changed": [],
-            "files_read": [],
-            "output_summary": proc.stdout[-500:] if proc.stdout else "(no output)",
+            "summary": summary,
+            "tokens": tokens_line,
+            "stderr_tail": stderr[-200:] if stderr else "",
         }
 
     except subprocess.TimeoutExpired:
-        return {"chunk": chunk_id, "status": "timeout", "files_changed": [], "files_read": [], "output_summary": "Timeout after {timeout}s"}
+        return {"chunk": chunk_id, "status": "timeout", "summary": f"Timeout after {timeout}s", "tokens": "", "stderr_tail": ""}
     except Exception as e:
-        return {"chunk": chunk_id, "status": "failed", "files_changed": [], "files_read": [], "output_summary": str(e)}
+        return {"chunk": chunk_id, "status": "failed", "summary": str(e)[:200], "tokens": "", "stderr_tail": ""}
+    finally:
+        if prompt_file.exists():
+            prompt_file.unlink()
 
 
 # ── Run all chunks ──────────────────────────────────────────
 def run_all(prompt, model, chunk_size, max_retries, workdir):
     workdir = Path(workdir).resolve()
-    tmpdir = Path(tempfile.mkdtemp(prefix="_harness_temp_", dir=workdir))
 
-    chunks = generate_chunks(prompt, chunk_size)
+    if "Read these files" in prompt:
+        chunks = chunk_by_files(prompt, chunk_size)
+    else:
+        chunks = [prompt]
+
     total = len(chunks)
     results = []
+    t0 = time.time()
 
-    print(f"\n{c('bold', 'Codex Harness')} — {total} chunk(s) — {c('cyan', model)}")
-    print(f"  {c('dim', workdir)}\n")
+    print(f"\n{hl('Codex Harness')}  {dim(str(total))} chunks  {CYAN}{model}{RESET}")
+    print(f"  {dim(str(workdir))}\n")
 
     for i, chunk_prompt in enumerate(chunks, 1):
-        chunk_id = i
-        label = chunk_prompt[:80].replace("\n", " ") + ("..." if len(chunk_prompt) > 80 else "")
-        print(status(i, total, label, "running"), end="\r", flush=True)
+        label = chunk_prompt[:80].replace("\n", " ")
+        if len(chunk_prompt) > 80:
+            label += "..."
+
+        print(f"  [{i}/{total}] {YELLOW}⏳{RESET} {label}", flush=True)
 
         result = None
         for attempt in range(1, max_retries + 1):
-            result = run_chunk(chunk_id, chunk_prompt, model, str(workdir))
-            if result.get("status") == "success":
+            result = run_chunk(i, chunk_prompt, model, str(workdir))
+            if result["status"] == "success":
                 break
             if attempt < max_retries:
-                print(status(i, total, f"{label} (retry {attempt + 1}/{max_retries})", "running"), end="\r", flush=True)
+                print(f"         {YELLOW}retry {attempt + 1}/{max_retries}{RESET}", flush=True)
                 time.sleep(2)
 
-        state = "done" if result.get("status") == "success" else "failed"
-        print(status(i, total, label, state))
+        # Overwrite line with final status
+        icon = ok("✓") if result["status"] == "success" else fail("✗")
+        elapsed = time.time() - t0
+        print(f"\033[1A\033[2K  [{i}/{total}] {icon} {label}  {dim(result.get('tokens', ''))}", flush=True)
         results.append(result)
 
-    # Merge report
-    print(f"\n{c('bold', 'Merging results...')}")
-    write_report(results, workdir)
+    # Summary
+    passed = sum(1 for r in results if r["status"] == "success")
+    failed = total - passed
+
+    print(f"\n{hl('Results:')} {ok(str(passed))} passed, {fail(str(failed))} failed  {dim(f'in {time.time()-t0:.0f}s')}")
+
+    # Detailed output per chunk
+    if failed:
+        print(f"\n{hl('Details:')}")
+        for r in results:
+            if r["status"] != "success":
+                print(f"  {fail('✗')} Chunk {r['chunk']}: {r['summary']}")
+                if r.get("stderr_tail"):
+                    print(f"    {dim('stderr:')} {r['stderr_tail'][:150]}")
 
     # Cleanup
-    for f in workdir.glob("_harness_result_*.json"):
+    for f in workdir.glob("_harness_prompt_*.txt"):
         f.unlink()
-    if tmpdir.exists():
-        import shutil
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    tmp = workdir / "_harness_temp_"
+    if tmp.exists():
+        shutil.rmtree(tmp, ignore_errors=True)
 
-    failed = sum(1 for r in results if r.get("status") != "success")
-    if failed:
-        print(f"\n{c('red', f'✗ {failed} chunk(s) failed')}")
-        sys.exit(1)
-    else:
-        print(f"\n{c('green', '✓ All chunks passed')}\n")
+    return 0 if failed == 0 else 1
 
 
-def generate_chunks(prompt, chunk_size):
-    """Split prompt into chunks. Simple: if prompt mentions files, split by files."""
-    if chunk_size <= 1 or "Read these files" not in prompt and "read every file" not in prompt.lower():
+def chunk_by_files(prompt, chunk_size):
+    """Split prompt by file list. Each chunk gets a subset of files."""
+    files = re.findall(r'([\w/\-\.]+\.[\w]+)', prompt)
+    files = [f for f in files if '.' in f and len(f) > 3 and '/' in f]
+
+    if not files:
         return [prompt]
 
-    # Extract file list from prompt
-    import re
-    files = re.findall(r'([\w/\-\.]+\.[\w]+)', prompt)
-    files = [f for f in files if '.' in f and len(f) > 2]
+    # Extract non-file parts (prefix + suffix)
+    prefix = prompt.split(files[0])[0].strip()
+    suffix = ""
+    last = files[-1]
+    if last in prompt:
+        suffix = prompt.split(last)[-1].strip()
 
     chunks = []
     for i in range(0, len(files), chunk_size):
         batch = files[i:i + chunk_size]
-        chunks.append(f"Read these files: {', '.join(batch)}. Complete your assigned portion of the audit and write results.")
+        file_list = ", ".join(batch)
+        chunks.append(f"{prefix} {file_list} {suffix}".strip())
 
-    return chunks if chunks else [prompt]
-
-
-def write_report(results, workdir):
-    """Write HARNESS_REPORT.md with combined findings."""
-    lines = ["# Harness Report", "", f"**Model:** {results[0].get('_model', 'unknown')}", f"**Chunks:** {len(results)}", ""]
-
-    success = sum(1 for r in results if r.get("status") == "success")
-    failed = len(results) - success
-    lines.append(f"**Status:** {success} passed, {failed} failed")
-    lines.append("")
-
-    for r in results:
-        icon = "✓" if r.get("status") == "success" else "✗"
-        lines.append(f"## Chunk {r['chunk']} {icon}")
-        lines.append(f"- **Status:** {r.get('status')}")
-        lines.append(f"- **Files changed:** {', '.join(r.get('files_changed', [])) or 'none'}")
-        lines.append(f"- **Files read:** {', '.join(r.get('files_read', [])) or 'none'}")
-        lines.append(f"- **Summary:** {r.get('output_summary', 'N/A')}")
-        lines.append("")
-
-    report_path = Path(workdir) / "HARNESS_REPORT.md"
-    report_path.write_text("\n".join(lines))
-    print(f"  {c('green', 'Report:')} {report_path}")
+    return chunks
 
 
 # ── CLI ─────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Codex Harness — orchestrate codex exec")
+    parser = argparse.ArgumentParser(description="Codex Harness")
     sub = parser.add_subparsers(dest="command")
 
-    run = sub.add_parser("run", help="Run a prompt through the harness")
-    run.add_argument("prompt", help="The prompt to execute")
-    run.add_argument("--chunk-size", type=int, default=10, help="Files per chunk (default: 10)")
-    run.add_argument("--model", default="gpt-5.4-mini", help="Codex model (default: gpt-5.4-mini)")
-    run.add_argument("--max-retries", type=int, default=2, help="Max retries per chunk (default: 2)")
-    run.add_argument("--workdir", default=".", help="Working directory")
+    run = sub.add_parser("run")
+    run.add_argument("prompt")
+    run.add_argument("--chunk-size", type=int, default=10)
+    run.add_argument("--model", default="gpt-5.4-mini")
+    run.add_argument("--max-retries", type=int, default=2)
+    run.add_argument("--workdir", default=".")
 
     args = parser.parse_args()
 
     if args.command == "run":
-        run_all(args.prompt, args.model, args.chunk_size, args.max_retries, args.workdir)
+        sys.exit(run_all(args.prompt, args.model, args.chunk_size, args.max_retries, args.workdir))
     else:
         parser.print_help()
 
